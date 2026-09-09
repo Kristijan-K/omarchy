@@ -1,0 +1,15 @@
+[Unit]
+Description=Refresh AI agent usage records (omarchy agents panel)
+
+# The agents panel displays the records omarchy-agent-usage-update writes
+# under ~/.local/state/omarchy/agents/usage/. The shell plugin also refreshes
+# them on its own timer while it runs, but a unit keeps the records current
+# when the shell is down or its update process is wedged.
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/omarchy-agent-usage-update
+NoNewPrivileges=true
+
+[Install]
+WantedBy=timers.target
