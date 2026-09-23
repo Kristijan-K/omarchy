@@ -44,6 +44,23 @@ grep -Fx $'rate\t10.8W' <<<"$shell_output" >/dev/null || fail "battery status re
 grep -Fx $'size\t56Wh' <<<"$shell_output" >/dev/null || fail "battery status reports full capacity"
 grep -Fx $'time\t2h 30m' <<<"$shell_output" >/dev/null || fail "battery status reports remaining time"
 
+# A bogus EC reading (e.g. MSI BIF0_9 reports current_now=-65A for a ~7.5W
+# discharge) must not clobber the good UPower rate with -1124W.
+printf -- '-65000000\n' >"$tmp_dir/power/BAT0/current_now"
+bogus_output=$(OMARCHY_POWER_SUPPLY_PATH="$tmp_dir/power" PATH="$tmp_dir/bin:$PATH" "$ROOT/bin/omarchy-battery-status" --shell)
+grep -Fx $'rate\t7.3W' <<<"$bogus_output" >/dev/null || fail "battery status keeps the UPower rate when sysfs current is bogus"
+
+# A non-numeric sysfs value is no reading at all.
+printf 'unknown\n' >"$tmp_dir/power/BAT0/current_now"
+garbage_output=$(OMARCHY_POWER_SUPPLY_PATH="$tmp_dir/power" PATH="$tmp_dir/bin:$PATH" "$ROOT/bin/omarchy-battery-status" --shell)
+grep -Fx $'rate\t7.3W' <<<"$garbage_output" >/dev/null || fail "battery status keeps the UPower rate when sysfs is non-numeric"
+
+# A sane negative discharge current keeps the live sysfs rate, shown as magnitude.
+printf -- '-500000\n' >"$tmp_dir/power/BAT0/current_now"
+printf '12000000\n' >"$tmp_dir/power/BAT0/voltage_now"
+negative_output=$(OMARCHY_POWER_SUPPLY_PATH="$tmp_dir/power" PATH="$tmp_dir/bin:$PATH" "$ROOT/bin/omarchy-battery-status" --shell)
+grep -Fx $'rate\t6W' <<<"$negative_output" >/dev/null || fail "battery status reports live sysfs rate as magnitude when discharging"
+
 if matches=$(rg -n 'omarchy-battery-(capacity|remaining|remaining-time)' "$ROOT/bin" "$ROOT/test" "$ROOT/shell" "$ROOT/docs"); then
   fail "battery status owns capacity and remaining calculations" "$matches"
 fi

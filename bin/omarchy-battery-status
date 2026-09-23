@@ -41,22 +41,41 @@ time_remaining=$(awk '/time to (empty|full)/ {
   }
   exit
 }' <<<"$battery_info")
-power_rate_raw=$(awk '/energy-rate/ { print $2; exit }' <<<"$battery_info")
+upower_rate=$(awk '/energy-rate/ { print $2; exit }' <<<"$battery_info")
+power_rate_raw="$upower_rate"
 native_path=$(awk '/native-path/ { print $2; exit }' <<<"$battery_info")
 battery_path="$power_supply_path/$native_path"
 
 # UPower's energy-rate can lag the kernel telemetry by tens of seconds. Use
 # the instantaneous sysfs reading when available so the open panel stays live.
-if [[ -r $battery_path/power_now ]]; then
-  power_rate_raw=$(awk -v microwatts="$(<"$battery_path/power_now")" 'BEGIN { print microwatts / 1000000 }')
-elif [[ -r $battery_path/current_now && -r $battery_path/voltage_now ]]; then
-  power_rate_raw=$(awk \
-    -v microamps="$(<"$battery_path/current_now")" \
-    -v microvolts="$(<"$battery_path/voltage_now")" \
+# Guards: the read must succeed and be numeric, and the magnitude must be sane.
+# Some ECs report bogus values (e.g. MSI BIF0_9 reports current_now=-65A for a
+# ~7.5W discharge, yielding -1124W), so reject anything above 150W or wildly
+# above UPower's rate and keep the UPower value instead.
+sysfs_rate=""
+if microwatts=$(cat "$battery_path/power_now" 2>/dev/null) && [[ $microwatts =~ ^[0-9]+$ ]]; then
+  sysfs_rate=$(awk -v microwatts="$microwatts" 'BEGIN { print microwatts / 1000000 }')
+elif microamps=$(cat "$battery_path/current_now" 2>/dev/null) && [[ $microamps =~ ^-?[0-9]+$ ]] \
+  && microvolts=$(cat "$battery_path/voltage_now" 2>/dev/null) && [[ $microvolts =~ ^[0-9]+$ ]]; then
+  sysfs_rate=$(awk \
+    -v microamps="$microamps" \
+    -v microvolts="$microvolts" \
     'BEGIN { print microamps * microvolts / 1000000000000 }')
 fi
 
+if [[ -n $sysfs_rate ]]; then
+  if awk -v s="${sysfs_rate:-0}" -v u="${upower_rate:-0}" 'BEGIN {
+    s_abs = (s < 0 ? -s : s)
+    u_abs = (u < 0 ? -u : u)
+    ok = (s_abs <= 150) && (u_abs <= 0.5 || s_abs <= 10 || s_abs <= 3 * u_abs)
+    exit !ok
+  }'; then
+    power_rate_raw="$sysfs_rate"
+  fi
+fi
+
 power_rate=$(awk -v rate="${power_rate_raw:-0}" 'BEGIN {
+  if (rate < 0) rate = -rate
   rounded = sprintf("%.1f", rate)
   sub(/\.0$/, "", rounded)
   print rounded
@@ -81,7 +100,7 @@ for supply in "$power_supply_path"/*; do
 done
 
 charge_idle=false
-if awk -v rate="${power_rate_raw:-0}" 'BEGIN { exit !(rate <= 0.2) }'; then
+if awk -v rate="${power_rate_raw:-0}" 'BEGIN { r = (rate < 0 ? -rate : rate); exit !(r <= 0.2) }'; then
   charge_idle=true
 fi
 
@@ -108,8 +127,15 @@ if [[ $shell_output == "true" ]]; then
   printf 'time\t%s\n' "$time_remaining"
 
   cycles=$(cat "$power_supply_path"/BAT*/cycle_count 2>/dev/null | head -1)
+  upower_cycles=$(awk '/charge-cycles/ { print $2; exit }' <<<"$battery_info")
 
-  [[ -n $cycles ]] && printf 'cycles\t%s\n' "$cycles"
+  # Some ECs report cycle_count 0 while UPower reports N/A. Omit it so the
+  # panel shows "—" instead of a misleading 0.
+  if [[ -n $cycles ]]; then
+    if ! { [[ $cycles == "0" ]] && { [[ -z $upower_cycles ]] || [[ $upower_cycles == "N/A" ]]; }; }; then
+      printf 'cycles\t%s\n' "$cycles"
+    fi
+  fi
 
   if [[ -n $threshold_end ]]; then
     if [[ -n $threshold_start && $threshold_start != $threshold_end ]]; then
