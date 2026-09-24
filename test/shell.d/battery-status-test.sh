@@ -7,6 +7,8 @@ source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/base-test.sh"
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
 
+export OMARCHY_BATTERY_CACHE="$tmp_dir/rate.cache"
+
 mkdir -p "$tmp_dir/bin"
 mkdir -p "$tmp_dir/power/BAT0"
 printf '900000\n' >"$tmp_dir/power/BAT0/current_now"
@@ -60,6 +62,44 @@ printf -- '-500000\n' >"$tmp_dir/power/BAT0/current_now"
 printf '12000000\n' >"$tmp_dir/power/BAT0/voltage_now"
 negative_output=$(OMARCHY_POWER_SUPPLY_PATH="$tmp_dir/power" PATH="$tmp_dir/bin:$PATH" "$ROOT/bin/omarchy-battery-status" --shell)
 grep -Fx $'rate\t6W' <<<"$negative_output" >/dev/null || fail "battery status reports live sysfs rate as magnitude when discharging"
+
+# When UPower wedges at 0W and sysfs is bogus, estimate from charge_now deltas:
+# 9000uAh dropped in 60s at 12V -> ~6.5W.
+mkdir -p "$tmp_dir/wedge/bin" "$tmp_dir/wedge/power/BAT0"
+cat >"$tmp_dir/wedge/bin/upower" <<'STUB'
+#!/bin/bash
+
+if [[ $1 == "-e" ]]; then
+  echo "/org/freedesktop/UPower/devices/battery_BAT0"
+  exit 0
+fi
+
+if [[ $1 == "-i" ]]; then
+  cat <<'INFO'
+  native-path:          BAT0
+  state:                discharging
+  energy:               28.3 Wh
+  energy-full:          56.7 Wh
+  energy-rate:          0 W
+  percentage:           51%
+INFO
+  exit 0
+fi
+
+exit 1
+STUB
+chmod +x "$tmp_dir/wedge/bin/upower"
+printf -- '-65000000\n' >"$tmp_dir/wedge/power/BAT0/current_now"
+printf '12000000\n' >"$tmp_dir/wedge/power/BAT0/voltage_now"
+printf '4600000\n' >"$tmp_dir/wedge/power/BAT0/charge_now"
+printf '%s 4609000 12000000\n' "$(( $(date +%s) - 60 ))" >"$tmp_dir/wedge.cache"
+wedge_output=$(OMARCHY_POWER_SUPPLY_PATH="$tmp_dir/wedge/power" OMARCHY_BATTERY_CACHE="$tmp_dir/wedge.cache" PATH="$tmp_dir/wedge/bin:$PATH" "$ROOT/bin/omarchy-battery-status" --shell)
+grep -Fx $'rate\t6.5W' <<<"$wedge_output" >/dev/null || fail "battery status estimates rate from charge deltas when UPower is wedged"
+
+# A stale cache must not feed the estimate; the wedged UPower 0W stands.
+printf '%s 4609000 12000000\n' "$(( $(date +%s) - 700 ))" >"$tmp_dir/stale.cache"
+stale_output=$(OMARCHY_POWER_SUPPLY_PATH="$tmp_dir/wedge/power" OMARCHY_BATTERY_CACHE="$tmp_dir/stale.cache" PATH="$tmp_dir/wedge/bin:$PATH" "$ROOT/bin/omarchy-battery-status" --shell)
+grep -Fx $'rate\t0W' <<<"$stale_output" >/dev/null || fail "battery status ignores a stale charge cache"
 
 if matches=$(rg -n 'omarchy-battery-(capacity|remaining|remaining-time)' "$ROOT/bin" "$ROOT/test" "$ROOT/shell" "$ROOT/docs"); then
   fail "battery status owns capacity and remaining calculations" "$matches"

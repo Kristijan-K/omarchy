@@ -43,6 +43,7 @@ time_remaining=$(awk '/time to (empty|full)/ {
 }' <<<"$battery_info")
 upower_rate=$(awk '/energy-rate/ { print $2; exit }' <<<"$battery_info")
 power_rate_raw="$upower_rate"
+state=$(awk '/state/ { print $2; exit }' <<<"$battery_info")
 native_path=$(awk '/native-path/ { print $2; exit }' <<<"$battery_info")
 battery_path="$power_supply_path/$native_path"
 
@@ -74,13 +75,47 @@ if [[ -n $sysfs_rate ]]; then
   fi
 fi
 
+# Last resort: estimate from charge_now deltas. UPower's estimator can wedge
+# at 0W for hours on ECs reporting bogus current, and sysfs is unusable then
+# too. Keep a tiny cache of the previous sample and derive W from the drop.
+rate_cache="${OMARCHY_BATTERY_CACHE:-${XDG_RUNTIME_DIR:-/tmp}/omarchy-battery-rate.cache}"
+now_ts=$(date +%s)
+charge_sample=$(cat "$battery_path/charge_now" 2>/dev/null)
+volt_sample=$(cat "$battery_path/voltage_now" 2>/dev/null)
+if awk -v u="${upower_rate:-0}" 'BEGIN { u_abs = (u < 0 ? -u : u); exit !(u_abs <= 0.5) }' \
+  && [[ $charge_sample =~ ^[0-9]+$ ]] && [[ $volt_sample =~ ^[0-9]+$ ]] \
+  && [[ -r $rate_cache ]]; then
+  read -r prev_ts prev_charge prev_volt <"$rate_cache" 2>/dev/null || true
+  if [[ $prev_ts =~ ^[0-9]+$ ]] && [[ $prev_charge =~ ^[0-9]+$ ]] && [[ $prev_volt =~ ^[0-9]+$ ]]; then
+    delta_ts=$((now_ts - prev_ts))
+    if (( delta_ts >= 5 && delta_ts <= 600 )); then
+      delta_charge=$((charge_sample - prev_charge))
+      if { [[ $state == "discharging" ]] && (( delta_charge < 0 )); } \
+        || { [[ $state == "charging" ]] && (( delta_charge > 0 )); }; then
+        avg_volt=$(((volt_sample + prev_volt) / 2))
+        estimate=$(awk -v dc="$delta_charge" -v v="$avg_volt" -v dt="$delta_ts" \
+          'BEGIN { dc_abs = (dc < 0 ? -dc : dc); print dc_abs / 1000000 * v / 1000000 / (dt / 3600) }')
+        if awk -v e="${estimate:-0}" 'BEGIN { exit !(e >= 0.2 && e <= 150) }'; then
+          power_rate_raw="$estimate"
+        fi
+      fi
+    fi
+  fi
+fi
+if [[ $charge_sample =~ ^[0-9]+$ ]] && [[ $volt_sample =~ ^[0-9]+$ ]]; then
+  cache_dir=$(dirname -- "$rate_cache")
+  if [[ -d $cache_dir ]] || mkdir -p -- "$cache_dir" 2>/dev/null; then
+    printf '%s %s %s\n' "$now_ts" "$charge_sample" "$volt_sample" >"$rate_cache.tmp" 2>/dev/null \
+      && mv -f "$rate_cache.tmp" "$rate_cache" 2>/dev/null || true
+  fi
+fi
+
 power_rate=$(awk -v rate="${power_rate_raw:-0}" 'BEGIN {
   if (rate < 0) rate = -rate
   rounded = sprintf("%.1f", rate)
   sub(/\.0$/, "", rounded)
   print rounded
 }')
-state=$(awk '/state/ { print $2; exit }' <<<"$battery_info")
 threshold_start=$(awk '/charge-start-threshold:/ { gsub(/%/, "", $2); print int($2); exit }' <<<"$battery_info")
 threshold_end=$(awk '/charge-end-threshold:/ { gsub(/%/, "", $2); print int($2); exit }' <<<"$battery_info")
 
