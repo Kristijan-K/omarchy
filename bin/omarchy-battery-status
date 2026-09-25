@@ -64,6 +64,7 @@ elif microamps=$(cat "$battery_path/current_now" 2>/dev/null) && [[ $microamps =
     'BEGIN { print microamps * microvolts / 1000000000000 }')
 fi
 
+sysfs_usable=false
 if [[ -n $sysfs_rate ]]; then
   if awk -v s="${sysfs_rate:-0}" -v u="${upower_rate:-0}" 'BEGIN {
     s_abs = (s < 0 ? -s : s)
@@ -72,42 +73,75 @@ if [[ -n $sysfs_rate ]]; then
     exit !ok
   }'; then
     power_rate_raw="$sysfs_rate"
+    sysfs_usable=true
   fi
 fi
 
-# Last resort: estimate from charge_now deltas. UPower's estimator can wedge
-# at 0W for hours on ECs reporting bogus current, and sysfs is unusable then
-# too. Keep a tiny cache of the previous sample and derive W from the drop.
+# Last resort: estimate from charge_now deltas. UPower's estimator can wedge at
+# 0W for hours on ECs reporting bogus current, and sysfs is unusable then too.
+# charge_now advances in whole steps, so a short window quantises badly (one
+# 1mAh step per 5s is 8.6W at 12V) and the panel would flicker between 0W and
+# multiples of that step. Keep a short history instead and measure across the
+# oldest sample that is at least 30s old, so the value tracks the actual load.
+# Every sample records the battery and charge state, so a swapped pack or an
+# AC transition can never borrow a reading from the previous battery state.
+minimum_window=30
+maximum_window=600
 rate_cache="${OMARCHY_BATTERY_CACHE:-${XDG_RUNTIME_DIR:-/tmp}/omarchy-battery-rate.cache}"
-now_ts=$(date +%s)
+cache_dir=$(dirname -- "$rate_cache")
 charge_sample=$(cat "$battery_path/charge_now" 2>/dev/null)
 volt_sample=$(cat "$battery_path/voltage_now" 2>/dev/null)
-if awk -v u="${upower_rate:-0}" 'BEGIN { u_abs = (u < 0 ? -u : u); exit !(u_abs <= 0.5) }' \
-  && [[ $charge_sample =~ ^[0-9]+$ ]] && [[ $volt_sample =~ ^[0-9]+$ ]] \
-  && [[ -r $rate_cache ]]; then
-  read -r prev_ts prev_charge prev_volt <"$rate_cache" 2>/dev/null || true
-  if [[ $prev_ts =~ ^[0-9]+$ ]] && [[ $prev_charge =~ ^[0-9]+$ ]] && [[ $prev_volt =~ ^[0-9]+$ ]]; then
-    delta_ts=$((now_ts - prev_ts))
-    if (( delta_ts >= 5 && delta_ts <= 600 )); then
-      delta_charge=$((charge_sample - prev_charge))
-      if { [[ $state == "discharging" ]] && (( delta_charge < 0 )); } \
-        || { [[ $state == "charging" ]] && (( delta_charge > 0 )); }; then
-        avg_volt=$(((volt_sample + prev_volt) / 2))
-        estimate=$(awk -v dc="$delta_charge" -v v="$avg_volt" -v dt="$delta_ts" \
-          'BEGIN { dc_abs = (dc < 0 ? -dc : dc); print dc_abs / 1000000 * v / 1000000 / (dt / 3600) }')
-        if awk -v e="${estimate:-0}" 'BEGIN { exit !(e >= 0.2 && e <= 150) }'; then
-          power_rate_raw="$estimate"
-        fi
-      fi
-    fi
-  fi
+sampleable=false
+if [[ $charge_sample =~ ^[0-9]+$ ]] && [[ $volt_sample =~ ^[0-9]+$ ]] \
+  && { [[ $state == "discharging" ]] || [[ $state == "charging" ]]; } \
+  && { [[ -d $cache_dir ]] || mkdir -p -- "$cache_dir" 2>/dev/null; }; then
+  sampleable=true
 fi
-if [[ $charge_sample =~ ^[0-9]+$ ]] && [[ $volt_sample =~ ^[0-9]+$ ]]; then
-  cache_dir=$(dirname -- "$rate_cache")
-  if [[ -d $cache_dir ]] || mkdir -p -- "$cache_dir" 2>/dev/null; then
-    printf '%s %s %s\n' "$now_ts" "$charge_sample" "$volt_sample" >"$rate_cache.tmp" 2>/dev/null \
-      && mv -f "$rate_cache.tmp" "$rate_cache" 2>/dev/null || true
+
+if [[ $sampleable == "true" ]]; then
+  now_ts=$(date +%s)
+
+  # Keep only this battery's samples from the current state, dropping anything
+  # past the maximum window.
+  kept_samples=()
+  if [[ -r $rate_cache ]]; then
+    while read -r sample_battery sample_state sample_ts sample_charge sample_volt; do
+      [[ $sample_battery == "$native_path" && $sample_state == "$state" ]] || continue
+      [[ $sample_ts =~ ^[0-9]+$ ]] || continue
+      (( now_ts - sample_ts <= maximum_window )) || continue
+      kept_samples+=("$sample_ts $sample_charge $sample_volt")
+    done <"$rate_cache"
   fi
+
+  # Estimate only when neither UPower nor sysfs supplied a usable rate. Older
+  # than the minimum window and there is nothing to measure yet, so the panel
+  # keeps UPower's 0W until the first full window elapses.
+  if [[ $sysfs_usable == "false" ]] \
+    && awk -v u="${upower_rate:-0}" 'BEGIN { u_abs = (u < 0 ? -u : u); exit !(u_abs <= 0.5) }'; then
+    for sample in "${kept_samples[@]}"; do
+      read -r sample_ts sample_charge sample_volt <<<"$sample"
+      if (( now_ts - sample_ts >= minimum_window )); then
+        delta_charge=$((charge_sample - sample_charge))
+        if { [[ $state == "discharging" ]] && (( delta_charge < 0 )); } \
+          || { [[ $state == "charging" ]] && (( delta_charge > 0 )); }; then
+          avg_volt=$(((volt_sample + sample_volt) / 2))
+          estimate=$(awk -v dc="$delta_charge" -v v="$avg_volt" -v dt="$((now_ts - sample_ts))" \
+            'BEGIN { dc_abs = (dc < 0 ? -dc : dc); print dc_abs / 1000000 * v / 1000000 / (dt / 3600) }')
+          if awk -v e="${estimate:-0}" 'BEGIN { exit !(e >= 0.2 && e <= 150) }'; then
+            power_rate_raw="$estimate"
+          fi
+        fi
+        break
+      fi
+    done
+  fi
+
+  {
+    for sample in "${kept_samples[@]}"; do
+      printf '%s %s %s\n' "$native_path" "$state" "$sample"
+    done
+    printf '%s %s %s %s %s\n' "$native_path" "$state" "$now_ts" "$charge_sample" "$volt_sample"
+  } >"$rate_cache.tmp" 2>/dev/null && mv -f "$rate_cache.tmp" "$rate_cache" 2>/dev/null || true
 fi
 
 power_rate=$(awk -v rate="${power_rate_raw:-0}" 'BEGIN {

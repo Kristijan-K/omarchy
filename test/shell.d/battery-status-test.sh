@@ -88,16 +88,52 @@ fi
 
 exit 1
 STUB
-chmod +x "$tmp_dir/wedge/bin/upower"
+cat >"$tmp_dir/wedge/bin/date" <<'STUB'
+#!/bin/bash
+
+if [[ $1 == "+%s" ]]; then
+  echo 1800000060
+  exit 0
+fi
+
+exec /usr/bin/date "$@"
+STUB
+chmod +x "$tmp_dir/wedge/bin/upower" "$tmp_dir/wedge/bin/date"
 printf -- '-65000000\n' >"$tmp_dir/wedge/power/BAT0/current_now"
 printf '12000000\n' >"$tmp_dir/wedge/power/BAT0/voltage_now"
 printf '4600000\n' >"$tmp_dir/wedge/power/BAT0/charge_now"
-printf '%s 4609000 12000000\n' "$(( $(date +%s) - 60 ))" >"$tmp_dir/wedge.cache"
+printf 'BAT0 discharging 1800000000 4609000 12000000\n' >"$tmp_dir/wedge.cache"
 wedge_output=$(OMARCHY_POWER_SUPPLY_PATH="$tmp_dir/wedge/power" OMARCHY_BATTERY_CACHE="$tmp_dir/wedge.cache" PATH="$tmp_dir/wedge/bin:$PATH" "$ROOT/bin/omarchy-battery-status" --shell)
 grep -Fx $'rate\t6.5W' <<<"$wedge_output" >/dev/null || fail "battery status estimates rate from charge deltas when UPower is wedged"
 
+# A younger sample must not become the reference window until 30s has passed.
+printf 'BAT0 discharging 1800000050 4609000 12000000\n' >"$tmp_dir/wedge-young.cache"
+young_output=$(OMARCHY_POWER_SUPPLY_PATH="$tmp_dir/wedge/power" OMARCHY_BATTERY_CACHE="$tmp_dir/wedge-young.cache" PATH="$tmp_dir/wedge/bin:$PATH" "$ROOT/bin/omarchy-battery-status" --shell)
+grep -Fx $'rate\t0W' <<<"$young_output" >/dev/null || fail "battery status does not estimate over a sub-30s window"
+
+# The history must retain older samples so the window grows instead of resetting.
+grep -c '^BAT0 discharging ' "$tmp_dir/wedge.cache" >/dev/null || fail "battery status keeps charge history"
+history_lines=$(grep -c '^BAT0 discharging ' "$tmp_dir/wedge.cache")
+(( history_lines == 2 )) || fail "battery status keeps the reference sample alongside new samples" "lines=$history_lines"
+
+# A sane sysfs reading wins even when UPower is wedged, as before the fallback.
+printf '900000\n' >"$tmp_dir/wedge/power/BAT0/current_now"
+healthy_output=$(OMARCHY_POWER_SUPPLY_PATH="$tmp_dir/wedge/power" OMARCHY_BATTERY_CACHE="$tmp_dir/wedge.cache" PATH="$tmp_dir/wedge/bin:$PATH" "$ROOT/bin/omarchy-battery-status" --shell)
+grep -Fx $'rate\t10.8W' <<<"$healthy_output" >/dev/null || fail "battery status prefers usable sysfs over the delta estimate"
+
+# A sample from another battery must not be reused.
+printf -- '-65000000\n' >"$tmp_dir/wedge/power/BAT0/current_now"
+printf 'BAT1 discharging 1800000000 4609000 12000000\n' >"$tmp_dir/wedge-other.cache"
+other_output=$(OMARCHY_POWER_SUPPLY_PATH="$tmp_dir/wedge/power" OMARCHY_BATTERY_CACHE="$tmp_dir/wedge-other.cache" PATH="$tmp_dir/wedge/bin:$PATH" "$ROOT/bin/omarchy-battery-status" --shell)
+grep -Fx $'rate\t0W' <<<"$other_output" >/dev/null || fail "battery status ignores samples from another battery"
+
+# A sample from another state must not be reused either.
+printf 'BAT0 charging 1800000000 4609000 12000000\n' >"$tmp_dir/wedge-state.cache"
+state_output=$(OMARCHY_POWER_SUPPLY_PATH="$tmp_dir/wedge/power" OMARCHY_BATTERY_CACHE="$tmp_dir/wedge-state.cache" PATH="$tmp_dir/wedge/bin:$PATH" "$ROOT/bin/omarchy-battery-status" --shell)
+grep -Fx $'rate\t0W' <<<"$state_output" >/dev/null || fail "battery status ignores samples from another state"
+
 # A stale cache must not feed the estimate; the wedged UPower 0W stands.
-printf '%s 4609000 12000000\n' "$(( $(date +%s) - 700 ))" >"$tmp_dir/stale.cache"
+printf 'BAT0 discharging 1799999000 4609000 12000000\n' >"$tmp_dir/stale.cache"
 stale_output=$(OMARCHY_POWER_SUPPLY_PATH="$tmp_dir/wedge/power" OMARCHY_BATTERY_CACHE="$tmp_dir/stale.cache" PATH="$tmp_dir/wedge/bin:$PATH" "$ROOT/bin/omarchy-battery-status" --shell)
 grep -Fx $'rate\t0W' <<<"$stale_output" >/dev/null || fail "battery status ignores a stale charge cache"
 
