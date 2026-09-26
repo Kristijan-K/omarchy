@@ -23,6 +23,21 @@ battery=$(upower -e 2>/dev/null | grep BAT | head -n 1)
 
 battery_info=$(upower -i "$battery")
 
+format_hours() {
+  awk -v hours="$1" 'BEGIN {
+    if (hours < 0) hours = 0
+    whole = int(hours)
+    minutes = int((hours - whole) * 60)
+    if (whole == 0) {
+      printf "%dm", minutes
+    } else if (minutes > 0) {
+      printf "%dh %dm", whole, minutes
+    } else {
+      printf "%dh", whole
+    }
+  }'
+}
+
 percentage=$(awk '/percentage/ { print int($2); exit }' <<<"$battery_info")
 capacity=$(awk '/energy-full:/ { printf "%d", $2; exit }' <<<"$battery_info")
 time_remaining=$(awk '/time to (empty|full)/ {
@@ -150,6 +165,23 @@ power_rate=$(awk -v rate="${power_rate_raw:-0}" 'BEGIN {
   sub(/\.0$/, "", rounded)
   print rounded
 }')
+
+# UPower drops its time estimate whenever its rate is wedged at 0W, which is
+# exactly when the estimated rate above takes over, and the panel then loses
+# the remaining-time row. Derive it from energy over the rate we settled on.
+if [[ -z $time_remaining ]] && awk -v rate="${power_rate_raw:-0}" 'BEGIN { r = (rate < 0 ? -rate : rate); exit !(r > 0.2) }'; then
+  energy_now=$(awk '$1 == "energy:" { print $2; exit }' <<<"$battery_info")
+  if [[ $energy_now =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    if [[ $state == "charging" ]]; then
+      time_remaining=$(format_hours "$(awk -v full="$capacity" -v now="$energy_now" -v r="${power_rate_raw:-0}" \
+        'BEGIN { r_abs = (r < 0 ? -r : r); d = full - now; if (d < 0) d = 0; print d / r_abs }')")
+    else
+      time_remaining=$(format_hours "$(awk -v now="$energy_now" -v r="${power_rate_raw:-0}" \
+        'BEGIN { r_abs = (r < 0 ? -r : r); print now / r_abs }')")
+    fi
+  fi
+fi
+
 threshold_start=$(awk '/charge-start-threshold:/ { gsub(/%/, "", $2); print int($2); exit }' <<<"$battery_info")
 threshold_end=$(awk '/charge-end-threshold:/ { gsub(/%/, "", $2); print int($2); exit }' <<<"$battery_info")
 

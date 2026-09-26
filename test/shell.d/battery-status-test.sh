@@ -105,6 +105,38 @@ printf '4600000\n' >"$tmp_dir/wedge/power/BAT0/charge_now"
 printf 'BAT0 discharging 1800000000 4609000 12000000\n' >"$tmp_dir/wedge.cache"
 wedge_output=$(OMARCHY_POWER_SUPPLY_PATH="$tmp_dir/wedge/power" OMARCHY_BATTERY_CACHE="$tmp_dir/wedge.cache" PATH="$tmp_dir/wedge/bin:$PATH" "$ROOT/bin/omarchy-battery-status" --shell)
 grep -Fx $'rate\t6.5W' <<<"$wedge_output" >/dev/null || fail "battery status estimates rate from charge deltas when UPower is wedged"
+grep -Fx $'time\t4h 22m' <<<"$wedge_output" >/dev/null || fail "battery status estimates time left from energy when UPower is wedged"
+
+# UPower can also report a rate while omitting its time estimate entirely; the
+# remaining time must still come from energy over that rate.
+mkdir -p "$tmp_dir/notime/bin" "$tmp_dir/notime/power/BAT0"
+cat >"$tmp_dir/notime/bin/upower" <<'STUB'
+#!/bin/bash
+
+if [[ $1 == "-e" ]]; then
+  echo "/org/freedesktop/UPower/devices/battery_BAT0"
+  exit 0
+fi
+
+if [[ $1 == "-i" ]]; then
+  cat <<'INFO'
+  native-path:          BAT0
+  state:                discharging
+  energy:               28.3 Wh
+  energy-full:          56.7 Wh
+  energy-rate:          7.3 W
+  percentage:           51%
+INFO
+  exit 0
+fi
+
+exit 1
+STUB
+chmod +x "$tmp_dir/notime/bin/upower"
+printf -- '-65000000\n' >"$tmp_dir/notime/power/BAT0/current_now"
+printf '12000000\n' >"$tmp_dir/notime/power/BAT0/voltage_now"
+notime_output=$(OMARCHY_POWER_SUPPLY_PATH="$tmp_dir/notime/power" OMARCHY_BATTERY_CACHE="$tmp_dir/notime.cache" PATH="$tmp_dir/notime/bin:$PATH" "$ROOT/bin/omarchy-battery-status" --shell)
+grep -Fx $'time\t3h 52m' <<<"$notime_output" >/dev/null || fail "battery status estimates time left when UPower omits it"
 
 # A younger sample must not become the reference window until 30s has passed.
 printf 'BAT0 discharging 1800000050 4609000 12000000\n' >"$tmp_dir/wedge-young.cache"
