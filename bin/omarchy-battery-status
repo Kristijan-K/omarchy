@@ -40,6 +40,7 @@ format_hours() {
 
 percentage=$(awk '/percentage/ { print int($2); exit }' <<<"$battery_info")
 capacity=$(awk '/energy-full:/ { printf "%d", $2; exit }' <<<"$battery_info")
+energy_full=$(awk '$1 == "energy-full:" { print $2; exit }' <<<"$battery_info")
 time_remaining=$(awk '/time to (empty|full)/ {
   value = $4
   unit = $5
@@ -98,16 +99,26 @@ fi
 # 1mAh step per 5s is 8.6W at 12V) and the panel would flicker between 0W and
 # multiples of that step. Keep a short history instead and measure across the
 # oldest sample that is at least 30s old, so the value tracks the actual load.
-# Every sample records the battery and charge state, so a swapped pack or an
-# AC transition can never borrow a reading from the previous battery state.
+# Every sample records the battery and charge state, and a gap longer than
+# reset_gap throws the history away, so a suspend, a hold at a charge limit, a
+# pack swap or an AC transition can never borrow a reading taken before it.
 minimum_window=30
-maximum_window=600
-rate_cache="${OMARCHY_BATTERY_CACHE:-${XDG_RUNTIME_DIR:-/tmp}/omarchy-battery-rate.cache}"
+maximum_window=120
+reset_gap=45
+if [[ -n ${OMARCHY_BATTERY_CACHE:-} ]]; then
+  rate_cache="$OMARCHY_BATTERY_CACHE"
+elif [[ -n ${XDG_RUNTIME_DIR:-} ]]; then
+  rate_cache="$XDG_RUNTIME_DIR/omarchy-battery-rate.cache"
+else
+  # A shared /tmp name is not safe to trust for arithmetic, so skip caching.
+  rate_cache=""
+fi
 cache_dir=$(dirname -- "$rate_cache")
 charge_sample=$(cat "$battery_path/charge_now" 2>/dev/null)
 volt_sample=$(cat "$battery_path/voltage_now" 2>/dev/null)
 sampleable=false
-if [[ $charge_sample =~ ^[0-9]+$ ]] && [[ $volt_sample =~ ^[0-9]+$ ]] \
+if [[ -n $rate_cache ]] \
+  && [[ $charge_sample =~ ^[0-9]+$ ]] && [[ $volt_sample =~ ^[0-9]+$ ]] \
   && { [[ $state == "discharging" ]] || [[ $state == "charging" ]]; } \
   && { [[ -d $cache_dir ]] || mkdir -p -- "$cache_dir" 2>/dev/null; }; then
   sampleable=true
@@ -117,15 +128,26 @@ if [[ $sampleable == "true" ]]; then
   now_ts=$(date +%s)
 
   # Keep only this battery's samples from the current state, dropping anything
-  # past the maximum window.
+  # past the maximum window or missing a numeric reading.
   kept_samples=()
   if [[ -r $rate_cache ]]; then
     while read -r sample_battery sample_state sample_ts sample_charge sample_volt; do
       [[ $sample_battery == "$native_path" && $sample_state == "$state" ]] || continue
       [[ $sample_ts =~ ^[0-9]+$ ]] || continue
+      [[ $sample_charge =~ ^[0-9]+$ && $sample_volt =~ ^[0-9]+$ ]] || continue
       (( now_ts - sample_ts <= maximum_window )) || continue
       kept_samples+=("$sample_ts $sample_charge $sample_volt")
     done <"$rate_cache"
+  fi
+
+  # A gap since the newest sample means the readings in between are unknown
+  # (suspend, a hold at a charge limit, a pack swap), so nothing in the history
+  # can be trusted as a baseline.
+  if (( ${#kept_samples[@]} > 0 )); then
+    read -r newest_ts _ _ <<<"${kept_samples[-1]}"
+    if (( now_ts - newest_ts > reset_gap )); then
+      kept_samples=()
+    fi
   fi
 
   # Estimate only when neither UPower nor sysfs supplied a usable rate. Older
@@ -173,7 +195,7 @@ if [[ -z $time_remaining ]] && awk -v rate="${power_rate_raw:-0}" 'BEGIN { r = (
   energy_now=$(awk '$1 == "energy:" { print $2; exit }' <<<"$battery_info")
   if [[ $energy_now =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
     if [[ $state == "charging" ]]; then
-      time_remaining=$(format_hours "$(awk -v full="$capacity" -v now="$energy_now" -v r="${power_rate_raw:-0}" \
+      time_remaining=$(format_hours "$(awk -v full="${energy_full:-$capacity}" -v now="$energy_now" -v r="${power_rate_raw:-0}" \
         'BEGIN { r_abs = (r < 0 ? -r : r); d = full - now; if (d < 0) d = 0; print d / r_abs }')")
     else
       time_remaining=$(format_hours "$(awk -v now="$energy_now" -v r="${power_rate_raw:-0}" \

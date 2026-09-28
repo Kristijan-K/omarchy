@@ -103,9 +103,33 @@ printf -- '-65000000\n' >"$tmp_dir/wedge/power/BAT0/current_now"
 printf '12000000\n' >"$tmp_dir/wedge/power/BAT0/voltage_now"
 printf '4600000\n' >"$tmp_dir/wedge/power/BAT0/charge_now"
 printf 'BAT0 discharging 1800000000 4609000 12000000\n' >"$tmp_dir/wedge.cache"
+printf 'BAT0 discharging 1800000055 4608000 12000000\n' >>"$tmp_dir/wedge.cache"
 wedge_output=$(OMARCHY_POWER_SUPPLY_PATH="$tmp_dir/wedge/power" OMARCHY_BATTERY_CACHE="$tmp_dir/wedge.cache" PATH="$tmp_dir/wedge/bin:$PATH" "$ROOT/bin/omarchy-battery-status" --shell)
 grep -Fx $'rate\t6.5W' <<<"$wedge_output" >/dev/null || fail "battery status estimates rate from charge deltas when UPower is wedged"
 grep -Fx $'time\t4h 22m' <<<"$wedge_output" >/dev/null || fail "battery status estimates time left from energy when UPower is wedged"
+
+# A gap since the last sample (suspend, a hold at a charge limit, a pack swap)
+# invalidates the history rather than measuring across it.
+printf 'BAT0 discharging 1800000000 4609000 12000000\n' >"$tmp_dir/wedge-gap.cache"
+gap_output=$(OMARCHY_POWER_SUPPLY_PATH="$tmp_dir/wedge/power" OMARCHY_BATTERY_CACHE="$tmp_dir/wedge-gap.cache" PATH="$tmp_dir/wedge/bin:$PATH" "$ROOT/bin/omarchy-battery-status" --shell)
+grep -Fx $'rate\t0W' <<<"$gap_output" >/dev/null || fail "battery status discards history across a sampling gap"
+
+# The oldest sample inside the window is the reference, so a burst of newer
+# samples cannot shrink the measurement window and inflate the rate.
+printf 'BAT0 discharging 1800000000 4610000 12000000\n' >"$tmp_dir/wedge-ref.cache"
+printf 'BAT0 discharging 1800000025 4609500 12000000\n' >>"$tmp_dir/wedge-ref.cache"
+ref_output=$(OMARCHY_POWER_SUPPLY_PATH="$tmp_dir/wedge/power" OMARCHY_BATTERY_CACHE="$tmp_dir/wedge-ref.cache" PATH="$tmp_dir/wedge/bin:$PATH" "$ROOT/bin/omarchy-battery-status" --shell)
+grep -Fx $'rate\t7.2W' <<<"$ref_output" >/dev/null || fail "battery status measures from the oldest sample in the window"
+
+# Cache fields reach shell arithmetic, so a non-numeric reading must be dropped
+# rather than evaluated or carried forward. The sample is recent so the gap
+# reset cannot account for dropping it.
+printf 'BAT0 discharging 1800000055 46abc 12000000\n' >"$tmp_dir/wedge-bad.cache"
+bad_output=$(OMARCHY_POWER_SUPPLY_PATH="$tmp_dir/wedge/power" OMARCHY_BATTERY_CACHE="$tmp_dir/wedge-bad.cache" PATH="$tmp_dir/wedge/bin:$PATH" "$ROOT/bin/omarchy-battery-status" --shell)
+grep -Fx $'rate\t0W' <<<"$bad_output" >/dev/null || fail "battery status ignores cache samples with non-numeric fields"
+if grep -q '46abc' "$tmp_dir/wedge-bad.cache"; then
+  fail "battery status drops non-numeric cache samples"
+fi
 
 # UPower can also report a rate while omitting its time estimate entirely; the
 # remaining time must still come from energy over that rate.
@@ -146,7 +170,7 @@ grep -Fx $'rate\t0W' <<<"$young_output" >/dev/null || fail "battery status does 
 # The history must retain older samples so the window grows instead of resetting.
 grep -c '^BAT0 discharging ' "$tmp_dir/wedge.cache" >/dev/null || fail "battery status keeps charge history"
 history_lines=$(grep -c '^BAT0 discharging ' "$tmp_dir/wedge.cache")
-(( history_lines == 2 )) || fail "battery status keeps the reference sample alongside new samples" "lines=$history_lines"
+(( history_lines == 3 )) || fail "battery status keeps the reference sample alongside new samples" "lines=$history_lines"
 
 # A sane sysfs reading wins even when UPower is wedged, as before the fallback.
 printf '900000\n' >"$tmp_dir/wedge/power/BAT0/current_now"
@@ -168,6 +192,38 @@ grep -Fx $'rate\t0W' <<<"$state_output" >/dev/null || fail "battery status ignor
 printf 'BAT0 discharging 1799999000 4609000 12000000\n' >"$tmp_dir/stale.cache"
 stale_output=$(OMARCHY_POWER_SUPPLY_PATH="$tmp_dir/wedge/power" OMARCHY_BATTERY_CACHE="$tmp_dir/stale.cache" PATH="$tmp_dir/wedge/bin:$PATH" "$ROOT/bin/omarchy-battery-status" --shell)
 grep -Fx $'rate\t0W' <<<"$stale_output" >/dev/null || fail "battery status ignores a stale charge cache"
+
+# Time to full must use the untruncated energy-full: 0.8Wh at 5W is about 9m,
+# not the 1m that the whole-Wh display capacity would give.
+mkdir -p "$tmp_dir/charging/bin" "$tmp_dir/charging/power/BAT0"
+cat >"$tmp_dir/charging/bin/upower" <<'STUB'
+#!/bin/bash
+
+if [[ $1 == "-e" ]]; then
+  echo "/org/freedesktop/UPower/devices/battery_BAT0"
+  exit 0
+fi
+
+if [[ $1 == "-i" ]]; then
+  cat <<'INFO'
+  native-path:          BAT0
+  state:                charging
+  energy:               55.9 Wh
+  energy-full:          56.7 Wh
+  energy-rate:          5 W
+  percentage:           99%
+INFO
+  exit 0
+fi
+
+exit 1
+STUB
+chmod +x "$tmp_dir/charging/bin/upower"
+printf -- '-65000000\n' >"$tmp_dir/charging/power/BAT0/current_now"
+printf '12000000\n' >"$tmp_dir/charging/power/BAT0/voltage_now"
+printf '4900000\n' >"$tmp_dir/charging/power/BAT0/charge_now"
+charging_output=$(OMARCHY_POWER_SUPPLY_PATH="$tmp_dir/charging/power" OMARCHY_BATTERY_CACHE="$tmp_dir/charging.cache" PATH="$tmp_dir/charging/bin:$PATH" "$ROOT/bin/omarchy-battery-status" --shell)
+grep -Fx $'time\t9m' <<<"$charging_output" >/dev/null || fail "battery status uses untruncated capacity for time to full"
 
 if matches=$(rg -n 'omarchy-battery-(capacity|remaining|remaining-time)' "$ROOT/bin" "$ROOT/test" "$ROOT/shell" "$ROOT/docs"); then
   fail "battery status owns capacity and remaining calculations" "$matches"
