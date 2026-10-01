@@ -99,12 +99,17 @@ fi
 # 1mAh step per 5s is 8.6W at 12V) and the panel would flicker between 0W and
 # multiples of that step. Keep a short history instead and measure across the
 # oldest sample that is at least 30s old, so the value tracks the actual load.
-# Every sample records the battery and charge state, and a gap longer than
-# reset_gap throws the history away, so a suspend, a hold at a charge limit, a
-# pack swap or an AC transition can never borrow a reading taken before it.
+# Samples record the battery and charge state, so a swapped pack or an AC
+# transition cannot borrow a reading from the wrong battery state.
+#
+# The history is capped at maximum_window and dropped wholesale when nothing
+# inside it is recent enough. That keeps an ordinary panel close short enough
+# to estimate on the next open, at the cost of showing UPower's 0W for the
+# first 30s after a gap longer than maximum_window (suspend, a long hold at a
+# charge limit, a pack swap) — none of which a script that only runs while the
+# panel is open can observe directly.
 minimum_window=30
 maximum_window=120
-reset_gap=45
 if [[ -n ${OMARCHY_BATTERY_CACHE:-} ]]; then
   rate_cache="$OMARCHY_BATTERY_CACHE"
 elif [[ -n ${XDG_RUNTIME_DIR:-} ]]; then
@@ -138,16 +143,6 @@ if [[ $sampleable == "true" ]]; then
       (( now_ts - sample_ts <= maximum_window )) || continue
       kept_samples+=("$sample_ts $sample_charge $sample_volt")
     done <"$rate_cache"
-  fi
-
-  # A gap since the newest sample means the readings in between are unknown
-  # (suspend, a hold at a charge limit, a pack swap), so nothing in the history
-  # can be trusted as a baseline.
-  if (( ${#kept_samples[@]} > 0 )); then
-    read -r newest_ts _ _ <<<"${kept_samples[-1]}"
-    if (( now_ts - newest_ts > reset_gap )); then
-      kept_samples=()
-    fi
   fi
 
   # Estimate only when neither UPower nor sysfs supplied a usable rate. Older

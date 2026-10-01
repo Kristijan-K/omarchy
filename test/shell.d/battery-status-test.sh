@@ -108,11 +108,31 @@ wedge_output=$(OMARCHY_POWER_SUPPLY_PATH="$tmp_dir/wedge/power" OMARCHY_BATTERY_
 grep -Fx $'rate\t6.5W' <<<"$wedge_output" >/dev/null || fail "battery status estimates rate from charge deltas when UPower is wedged"
 grep -Fx $'time\t4h 22m' <<<"$wedge_output" >/dev/null || fail "battery status estimates time left from energy when UPower is wedged"
 
-# A gap since the last sample (suspend, a hold at a charge limit, a pack swap)
-# invalidates the history rather than measuring across it.
-printf 'BAT0 discharging 1800000000 4609000 12000000\n' >"$tmp_dir/wedge-gap.cache"
-gap_output=$(OMARCHY_POWER_SUPPLY_PATH="$tmp_dir/wedge/power" OMARCHY_BATTERY_CACHE="$tmp_dir/wedge-gap.cache" PATH="$tmp_dir/wedge/bin:$PATH" "$ROOT/bin/omarchy-battery-status" --shell)
-grep -Fx $'rate\t0W' <<<"$gap_output" >/dev/null || fail "battery status discards history across a sampling gap"
+# A panel closed for less than the maximum window must still estimate on the
+# next open, so an ordinary glance is not punished with 30s of UPower's 0W.
+printf 'BAT0 discharging 1799999950 4619000 12000000\n' >"$tmp_dir/closed.cache"
+printf 'BAT0 discharging 1800000000 4610000 12000000\n' >>"$tmp_dir/closed.cache"
+closed_output=$(OMARCHY_POWER_SUPPLY_PATH="$tmp_dir/wedge/power" OMARCHY_BATTERY_CACHE="$tmp_dir/closed.cache" PATH="$tmp_dir/wedge/bin:$PATH" "$ROOT/bin/omarchy-battery-status" --shell)
+grep -Fx $'rate\t7.5W' <<<"$closed_output" >/dev/null || fail "battery status estimates on reopen after a short close"
+grep -Fx $'time\t3h 47m' <<<"$closed_output" >/dev/null || fail "battery status estimates time on reopen after a short close"
+
+# A close longer than the maximum window leaves nothing recent enough to
+# measure, so the estimate waits for a fresh window.
+printf 'BAT0 discharging 1799999760 4619000 12000000\n' >"$tmp_dir/closed-long.cache"
+closed_long_output=$(OMARCHY_POWER_SUPPLY_PATH="$tmp_dir/wedge/power" OMARCHY_BATTERY_CACHE="$tmp_dir/closed-long.cache" PATH="$tmp_dir/wedge/bin:$PATH" "$ROOT/bin/omarchy-battery-status" --shell)
+grep -Fx $'rate\t0W' <<<"$closed_long_output" >/dev/null || fail "battery status does not estimate across a close longer than the window"
+if [[ -n $(awk -F'\t' '/^time/{print $2}' <<<"$closed_long_output") ]]; then
+  fail "battery status reports no time across a close longer than the window"
+fi
+
+# Samples older than the maximum window are dropped, so the reference is the
+# oldest sample that is still inside it.
+printf 'BAT0 discharging 1799999920 4620000 12000000\n' >"$tmp_dir/window.cache"
+printf 'BAT0 discharging 1799999960 4610000 12000000\n' >>"$tmp_dir/window.cache"
+printf 'BAT0 discharging 1800000000 4606000 12000000\n' >>"$tmp_dir/window.cache"
+printf 'BAT0 discharging 1800000040 4602000 12000000\n' >>"$tmp_dir/window.cache"
+window_output=$(OMARCHY_POWER_SUPPLY_PATH="$tmp_dir/wedge/power" OMARCHY_BATTERY_CACHE="$tmp_dir/window.cache" PATH="$tmp_dir/wedge/bin:$PATH" "$ROOT/bin/omarchy-battery-status" --shell)
+grep -Fx $'rate\t4.3W' <<<"$window_output" >/dev/null || fail "battery status measures within the maximum window"
 
 # The oldest sample inside the window is the reference, so a burst of newer
 # samples cannot shrink the measurement window and inflate the rate.
@@ -122,14 +142,20 @@ ref_output=$(OMARCHY_POWER_SUPPLY_PATH="$tmp_dir/wedge/power" OMARCHY_BATTERY_CA
 grep -Fx $'rate\t7.2W' <<<"$ref_output" >/dev/null || fail "battery status measures from the oldest sample in the window"
 
 # Cache fields reach shell arithmetic, so a non-numeric reading must be dropped
-# rather than evaluated or carried forward. The sample is recent so the gap
-# reset cannot account for dropping it.
-printf 'BAT0 discharging 1800000055 46abc 12000000\n' >"$tmp_dir/wedge-bad.cache"
+# rather than evaluated or carried forward. The sample is inside the window so
+# the window filter cannot account for dropping it.
+printf 'BAT0 discharging 1800000025 46abc 12000000\n' >"$tmp_dir/wedge-bad.cache"
 bad_output=$(OMARCHY_POWER_SUPPLY_PATH="$tmp_dir/wedge/power" OMARCHY_BATTERY_CACHE="$tmp_dir/wedge-bad.cache" PATH="$tmp_dir/wedge/bin:$PATH" "$ROOT/bin/omarchy-battery-status" --shell)
 grep -Fx $'rate\t0W' <<<"$bad_output" >/dev/null || fail "battery status ignores cache samples with non-numeric fields"
 if grep -q '46abc' "$tmp_dir/wedge-bad.cache"; then
   fail "battery status drops non-numeric cache samples"
 fi
+
+# A sample that reaches the arithmetic with its voltage missing must be dropped,
+# not averaged as if the voltage were zero.
+printf 'BAT0 discharging 1800000025 4609000\n' >"$tmp_dir/novolt.cache"
+novolt_output=$(OMARCHY_POWER_SUPPLY_PATH="$tmp_dir/wedge/power" OMARCHY_BATTERY_CACHE="$tmp_dir/novolt.cache" PATH="$tmp_dir/wedge/bin:$PATH" "$ROOT/bin/omarchy-battery-status" --shell)
+grep -Fx $'rate\t0W' <<<"$novolt_output" >/dev/null || fail "battery status ignores a sample without a voltage"
 
 # UPower can also report a rate while omitting its time estimate entirely; the
 # remaining time must still come from energy over that rate.
@@ -177,18 +203,20 @@ printf '900000\n' >"$tmp_dir/wedge/power/BAT0/current_now"
 healthy_output=$(OMARCHY_POWER_SUPPLY_PATH="$tmp_dir/wedge/power" OMARCHY_BATTERY_CACHE="$tmp_dir/wedge.cache" PATH="$tmp_dir/wedge/bin:$PATH" "$ROOT/bin/omarchy-battery-status" --shell)
 grep -Fx $'rate\t10.8W' <<<"$healthy_output" >/dev/null || fail "battery status prefers usable sysfs over the delta estimate"
 
-# A sample from another battery must not be reused.
+# A sample from another battery must not be reused. It is 35s old, so the
+# window filter keeps it and only the identity check can drop it.
 printf -- '-65000000\n' >"$tmp_dir/wedge/power/BAT0/current_now"
-printf 'BAT1 discharging 1800000000 4609000 12000000\n' >"$tmp_dir/wedge-other.cache"
+printf 'BAT1 discharging 1800000025 4609000 12000000\n' >"$tmp_dir/wedge-other.cache"
 other_output=$(OMARCHY_POWER_SUPPLY_PATH="$tmp_dir/wedge/power" OMARCHY_BATTERY_CACHE="$tmp_dir/wedge-other.cache" PATH="$tmp_dir/wedge/bin:$PATH" "$ROOT/bin/omarchy-battery-status" --shell)
 grep -Fx $'rate\t0W' <<<"$other_output" >/dev/null || fail "battery status ignores samples from another battery"
 
 # A sample from another state must not be reused either.
-printf 'BAT0 charging 1800000000 4609000 12000000\n' >"$tmp_dir/wedge-state.cache"
+printf 'BAT0 charging 1800000025 4609000 12000000\n' >"$tmp_dir/wedge-state.cache"
 state_output=$(OMARCHY_POWER_SUPPLY_PATH="$tmp_dir/wedge/power" OMARCHY_BATTERY_CACHE="$tmp_dir/wedge-state.cache" PATH="$tmp_dir/wedge/bin:$PATH" "$ROOT/bin/omarchy-battery-status" --shell)
 grep -Fx $'rate\t0W' <<<"$state_output" >/dev/null || fail "battery status ignores samples from another state"
 
-# A stale cache must not feed the estimate; the wedged UPower 0W stands.
+# A cache older than the maximum window must not feed the estimate; the wedged
+# UPower 0W stands.
 printf 'BAT0 discharging 1799999000 4609000 12000000\n' >"$tmp_dir/stale.cache"
 stale_output=$(OMARCHY_POWER_SUPPLY_PATH="$tmp_dir/wedge/power" OMARCHY_BATTERY_CACHE="$tmp_dir/stale.cache" PATH="$tmp_dir/wedge/bin:$PATH" "$ROOT/bin/omarchy-battery-status" --shell)
 grep -Fx $'rate\t0W' <<<"$stale_output" >/dev/null || fail "battery status ignores a stale charge cache"
