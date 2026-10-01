@@ -133,13 +133,15 @@ if [[ $sampleable == "true" ]]; then
   now_ts=$(date +%s)
 
   # Keep only this battery's samples from the current state, dropping anything
-  # past the maximum window or missing a numeric reading.
+  # past the maximum window, dated in the future (a wall-clock correction can
+  # push samples ahead), or missing a numeric reading.
   kept_samples=()
   if [[ -r $rate_cache ]]; then
     while read -r sample_battery sample_state sample_ts sample_charge sample_volt; do
       [[ $sample_battery == "$native_path" && $sample_state == "$state" ]] || continue
       [[ $sample_ts =~ ^[0-9]+$ ]] || continue
       [[ $sample_charge =~ ^[0-9]+$ && $sample_volt =~ ^[0-9]+$ ]] || continue
+      (( sample_ts <= now_ts )) || continue
       (( now_ts - sample_ts <= maximum_window )) || continue
       kept_samples+=("$sample_ts $sample_charge $sample_volt")
     done <"$rate_cache"
@@ -168,12 +170,17 @@ if [[ $sampleable == "true" ]]; then
     done
   fi
 
+  # A per-process temp file keeps a concurrent run (the panel refreshes every
+  # 5s while the notification can invoke the script independently) from
+  # interleaving with this one; the atomic rename then publishes one complete
+  # cache and the other run's sample is simply dropped.
+  cache_tmp="$rate_cache.$$.tmp"
   {
     for sample in "${kept_samples[@]}"; do
       printf '%s %s %s\n' "$native_path" "$state" "$sample"
     done
     printf '%s %s %s %s %s\n' "$native_path" "$state" "$now_ts" "$charge_sample" "$volt_sample"
-  } >"$rate_cache.tmp" 2>/dev/null && mv -f "$rate_cache.tmp" "$rate_cache" 2>/dev/null || true
+  } >"$cache_tmp" 2>/dev/null && mv -f "$cache_tmp" "$rate_cache" 2>/dev/null || rm -f -- "$cache_tmp"
 fi
 
 power_rate=$(awk -v rate="${power_rate_raw:-0}" 'BEGIN {

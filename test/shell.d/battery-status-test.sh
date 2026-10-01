@@ -221,6 +221,26 @@ printf 'BAT0 discharging 1799999000 4609000 12000000\n' >"$tmp_dir/stale.cache"
 stale_output=$(OMARCHY_POWER_SUPPLY_PATH="$tmp_dir/wedge/power" OMARCHY_BATTERY_CACHE="$tmp_dir/stale.cache" PATH="$tmp_dir/wedge/bin:$PATH" "$ROOT/bin/omarchy-battery-status" --shell)
 grep -Fx $'rate\t0W' <<<"$stale_output" >/dev/null || fail "battery status ignores a stale charge cache"
 
+# A sample dated in the future (a wall-clock correction) is not a usable window.
+printf 'BAT0 discharging 1800000900 4609000 12000000\n' >"$tmp_dir/future.cache"
+future_output=$(OMARCHY_POWER_SUPPLY_PATH="$tmp_dir/wedge/power" OMARCHY_BATTERY_CACHE="$tmp_dir/future.cache" PATH="$tmp_dir/wedge/bin:$PATH" "$ROOT/bin/omarchy-battery-status" --shell)
+grep -Fx $'rate\t0W' <<<"$future_output" >/dev/null || fail "battery status ignores future-dated samples"
+if grep -q '1800000900' "$tmp_dir/future.cache"; then
+  fail "battery status drops future-dated cache samples"
+fi
+
+# Cycle count: an EC reporting 0 while UPower says N/A means "unknown", so the
+# row is omitted; a real count is shown.
+printf '0\n' >"$tmp_dir/wedge/power/BAT0/cycle_count"
+unknown_cycles_output=$(OMARCHY_POWER_SUPPLY_PATH="$tmp_dir/wedge/power" OMARCHY_BATTERY_CACHE="$tmp_dir/cycles.cache" PATH="$tmp_dir/wedge/bin:$PATH" "$ROOT/bin/omarchy-battery-status" --shell)
+if grep -q $'^cycles\t' <<<"$unknown_cycles_output"; then
+  fail "battery status omits an unknown cycle count"
+fi
+printf '7\n' >"$tmp_dir/wedge/power/BAT0/cycle_count"
+known_cycles_output=$(OMARCHY_POWER_SUPPLY_PATH="$tmp_dir/wedge/power" OMARCHY_BATTERY_CACHE="$tmp_dir/cycles.cache" PATH="$tmp_dir/wedge/bin:$PATH" "$ROOT/bin/omarchy-battery-status" --shell)
+grep -Fx $'cycles\t7' <<<"$known_cycles_output" >/dev/null || fail "battery status reports a known cycle count"
+rm -f "$tmp_dir/wedge/power/BAT0/cycle_count"
+
 # Time to full must use the untruncated energy-full: 0.8Wh at 5W is about 9m,
 # not the 1m that the whole-Wh display capacity would give.
 mkdir -p "$tmp_dir/charging/bin" "$tmp_dir/charging/power/BAT0"
