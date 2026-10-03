@@ -45,10 +45,10 @@ SCAN_REUSE_SECONDS = 20
 LIMITS_ONLY_REUSE_SECONDS = 900
 LOCAL_STATS_CACHE_SCHEMA_VERSION = 3
 
-# A month is the horizon every local source is windowed to: older usage is
-# history, not subscription burn, and the panel never shows it. Native Codex
-# session files are picked by mtime against this cutoff; the opencode
-# database skips older messages in SQL before their blobs are ever parsed.
+# Native Codex sessions and the opencode database are read a month back:
+# older usage is history, not subscription burn. Native session files are
+# picked by mtime against this cutoff; the opencode database skips older
+# messages in SQL before their blobs are ever parsed.
 SCAN_WINDOW_SECONDS = 30 * 24 * 60 * 60
 
 # Per-file totals of native Codex sessions survive between runs, so a rescan
