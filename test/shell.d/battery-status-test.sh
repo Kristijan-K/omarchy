@@ -331,6 +331,21 @@ grep -Fx $'rate\t0W' <<<"$future_output" >/dev/null || fail "battery status igno
 if grep -q '1800000900' "$tmp_dir/future.cache"; then
   fail "battery status drops future-dated cache samples"
 fi
+
+# A hold at a charge limit interrupts sampling, so the discharge history from
+# before it must not be measured across it: unplugging within the window would
+# otherwise report the hold's elapsed time as draw time.
+printf 'BAT0 discharging 1799999950 4619000 12000000\n' >"$tmp_dir/hold.cache"
+printf 'BAT0 discharging 1800000000 4610000 12000000\n' >>"$tmp_dir/hold.cache"
+sed -i 's/state:                discharging/state:                pending-charge/' "$tmp_dir/wedge/bin/upower"
+hold_output=$(OMARCHY_POWER_SUPPLY_PATH="$tmp_dir/wedge/power" OMARCHY_BATTERY_CACHE="$tmp_dir/hold.cache" PATH="$tmp_dir/wedge/bin:$PATH" "$ROOT/bin/omarchy-battery-status" --shell)
+sed -i 's/state:                pending-charge/state:                discharging/' "$tmp_dir/wedge/bin/upower"
+grep -Fx $'rate\t0W' <<<"$hold_output" >/dev/null || fail "battery status does not estimate while a hold is in progress" "$hold_output"
+if grep -q '^BAT0 ' "$tmp_dir/hold.cache" 2>/dev/null; then
+  fail "battery status drops a charge history the hold interrupted"
+fi
+pass "battery status drops a charge history a hold interrupted"
+
 pass "battery status estimates from a bounded, validated charge history"
 
 # The history must retain older samples so the window grows instead of resetting.

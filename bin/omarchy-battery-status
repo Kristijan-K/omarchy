@@ -121,6 +121,17 @@ fi
 cache_dir=$(dirname -- "$rate_cache")
 charge_sample=$(cat "$battery_path/charge_now" 2>/dev/null)
 volt_sample=$(cat "$battery_path/voltage_now" 2>/dev/null)
+
+# Sampling only happens while the battery is charging or discharging. A hold at
+# a charge limit (pending-charge, fully-charged) or an unknown state is observed
+# here between the two halves of a discharge, so the history from before it must
+# not be measured across it: the elapsed time would include the hold and report
+# too little draw with too much time left. A closed panel runs no script and so
+# leaves the history alone, which a state change does not.
+if [[ -n $rate_cache && $state != "discharging" && $state != "charging" ]]; then
+  rm -f -- "$rate_cache"
+fi
+
 sampleable=false
 if [[ -n $rate_cache ]] \
   && [[ $charge_sample =~ ^[0-9]+$ ]] && [[ $volt_sample =~ ^[0-9]+$ ]] \
