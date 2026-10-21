@@ -384,6 +384,13 @@ def scan_opencode_sessions():
     return False
   try:
     conn.execute("PRAGMA query_only = ON")
+    # A fresh v2 install has no classic message table: nothing to read is a
+    # complete scan, not an interrupted one, or those totals would never be
+    # cached and every refresh would rescan the database.
+    if not conn.execute(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'message'"
+    ).fetchone():
+      return True
     # OpenCode DBs grow huge (every historical message, JSON included), and
     # Python-side json.loads of every row wasted ~600 MB of RSS on machines
     # whose subscription never ran on OpenAI. The json_extract conditions are

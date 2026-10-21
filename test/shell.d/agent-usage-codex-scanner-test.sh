@@ -293,6 +293,77 @@ result=$(HOME="$WINDOW_HOME" CODEX_HOME="$WINDOW_HOME/.codex" XDG_DATA_HOME="$WI
   fail "Codex collector reads v2 OpenAI sessions and never counts OpenCode Go providers" "$result"
 pass "Codex collector counts only recent OpenAI usage from opencode sessions"
 
+# A fresh OpenCode v2 install has no classic message table. That is an empty
+# scan, not an interrupted one, so its totals are still cached: otherwise every
+# refresh and every --limits-only would rescan the database.
+V2ONLY_HOME=$(signed_in_home)
+cp "$TEST_HOME/bin/codex" "$V2ONLY_HOME/bin/codex"
+
+python3 - "$V2ONLY_HOME/.local/share/opencode/opencode.db" <<'PY'
+import json
+import sqlite3
+import sys
+import time
+from pathlib import Path
+
+db = Path(sys.argv[1])
+db.parent.mkdir(parents=True, exist_ok=True)
+conn = sqlite3.connect(db)
+conn.execute("""CREATE TABLE session_v2 (
+  id text PRIMARY KEY, time_created integer NOT NULL, time_updated integer NOT NULL)""")
+conn.execute("""CREATE TABLE session_message (
+  id text PRIMARY KEY, session_id text NOT NULL, type text NOT NULL,
+  seq integer NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)""")
+now_ms = int(time.time() * 1000)
+
+def v2_message(id, input):
+  return (id, "ses_v2", "assistant", 1, now_ms, now_ms, json.dumps({
+    "time": {"created": now_ms},
+    "model": {"id": "gpt-5.6-terra", "providerID": "openai"},
+    "tokens": {"input": input, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}},
+  }))
+
+conn.execute("INSERT INTO session_message VALUES (?, ?, ?, ?, ?, ?, ?)", v2_message("vo_1", 4))
+conn.commit()
+conn.close()
+PY
+
+result=$(HOME="$V2ONLY_HOME" CODEX_HOME="$V2ONLY_HOME/.codex" XDG_CACHE_HOME="$V2ONLY_HOME/.cache" XDG_DATA_HOME="$V2ONLY_HOME/.local/share" \
+  PATH="$V2ONLY_HOME/bin:$PATH" "$collector")
+
+[[ $(jq -r '.todayTotalTokens' <<<"$result") == "4" ]] ||
+  fail "Codex collector reads a v2-only opencode database" "$result"
+v2only_cache=$(ls "$V2ONLY_HOME/.cache/omarchy/agent-usage/"/codex-scan-*.json 2>/dev/null | head -n 1)
+[[ -n $v2only_cache && $(jq -r '.stats.todayTotalTokens' "$v2only_cache") == "4" ]] ||
+  fail "Codex collector caches a v2-only scan" "$result"
+
+# A message added afterwards must not show through --limits-only.
+python3 - "$V2ONLY_HOME/.local/share/opencode/opencode.db" <<'PY'
+import json
+import sqlite3
+import sys
+import time
+
+conn = sqlite3.connect(sys.argv[1])
+now_ms = int(time.time() * 1000)
+conn.execute("INSERT INTO session_message VALUES (?, ?, ?, ?, ?, ?, ?)", (
+  "vo_2", "ses_v2", "assistant", 2, now_ms, now_ms, json.dumps({
+    "time": {"created": now_ms},
+    "model": {"id": "gpt-5.6-terra", "providerID": "openai"},
+    "tokens": {"input": 6, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}},
+  }),
+))
+conn.commit()
+conn.close()
+PY
+
+result=$(HOME="$V2ONLY_HOME" CODEX_HOME="$V2ONLY_HOME/.codex" XDG_CACHE_HOME="$V2ONLY_HOME/.cache" XDG_DATA_HOME="$V2ONLY_HOME/.local/share" \
+  PATH="$V2ONLY_HOME/bin:$PATH" "$collector" --limits-only)
+
+[[ $(jq -r '.todayTotalTokens' <<<"$result") == "4" ]] ||
+  fail "Codex collector --limits-only reuses a v2-only cache" "$result"
+pass "Codex collector caches a v2-only opencode scan"
+
 # A warm cache makes --limits-only cheap: local stats come from the last scan
 # instead of another walk over the opencode database, and --force bypasses it.
 CACHE_HOME=$(signed_in_home)
@@ -710,7 +781,12 @@ from pathlib import Path
 db = Path(sys.argv[1])
 db.parent.mkdir(parents=True, exist_ok=True)
 conn = sqlite3.connect(db)
-conn.execute("CREATE TABLE unrelated (id text PRIMARY KEY)")
+# A message table of the wrong shape, as a half-finished migration leaves it:
+# the scan queries columns it does not have and stops with a database error. A
+# missing table is different, and counts as a complete empty scan (a v2-only
+# install), which is covered by the v2-only cache test above.
+conn.execute("CREATE TABLE message (id text PRIMARY KEY, payload text)")
+conn.execute("INSERT INTO message VALUES ('i_broken', '{}')")
 conn.commit()
 conn.close()
 PY
@@ -734,6 +810,7 @@ from pathlib import Path
 
 db = Path(sys.argv[1])
 conn = sqlite3.connect(db)
+conn.execute("DROP TABLE message")
 conn.execute("CREATE TABLE message (id text PRIMARY KEY, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)")
 now_ms = int(time.time() * 1000)
 conn.execute("INSERT INTO message VALUES (?, ?, ?, ?, ?)", (
