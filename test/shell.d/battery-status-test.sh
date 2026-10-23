@@ -7,6 +7,18 @@ source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/base-test.sh"
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
 
+# Every run of the script shares this scratch cache. Without it, a fixture that
+# reaches the script's state handling would clear (or write) the battery history
+# in the developer's real $XDG_RUNTIME_DIR.
+export OMARCHY_BATTERY_CACHE="$tmp_dir/rate.cache"
+
+# The real runtime directory must stay untouched too, so point it at scratch and
+# seed a history that no fixture is allowed to clear.
+export XDG_RUNTIME_DIR="$tmp_dir/runtime"
+mkdir -p "$XDG_RUNTIME_DIR"
+runtime_cache="$XDG_RUNTIME_DIR/omarchy-battery-rate.cache"
+printf 'BAT0 discharging 1 4600000 12000000\n' >"$runtime_cache"
+
 mkdir -p "$tmp_dir/bin"
 # Apple Silicon: a battery not called BAT*, power_now signed by direction, and
 # the thresholds and cycle count only under the native path.
@@ -406,6 +418,13 @@ known_cycles_output=$(OMARCHY_POWER_SUPPLY_PATH="$tmp_dir/wedge/power" OMARCHY_B
 grep -Fx $'cycles\t7' <<<"$known_cycles_output" >/dev/null || fail "battery status reports a known cycle count"
 rm -f "$tmp_dir/wedge/power/BAT0/cycle_count"
 pass "battery status suppresses an unknown cycle count"
+
+# No run above may have fallen back to the runtime directory: a fully charged
+# fixture clears the charge history, and doing that to the real cache would cost
+# the machine 30s of readings.
+[[ $(cat "$runtime_cache" 2>/dev/null) == "BAT0 discharging 1 4600000 12000000" ]] ||
+  fail "battery status tests leave the runtime charge cache alone"
+pass "battery status tests leave the runtime charge cache alone"
 
 if matches=$(rg -n 'omarchy-battery-(capacity|remaining|remaining-time)' "$ROOT/bin" "$ROOT/test" "$ROOT/shell" "$ROOT/docs"); then
   fail "battery status owns capacity and remaining calculations" "$matches"
